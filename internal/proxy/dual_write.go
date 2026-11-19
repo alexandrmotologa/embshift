@@ -158,7 +158,7 @@ func (dw *DualWriter) drainReplicationBatch(ctx context.Context, limit int) {
 		if err != nil {
 			log.Printf("[replication_worker] secondary embedding error: %v", err)
 			for _, ev := range upsertEvents {
-				_ = dw.queue.Nack(ev.ID, err.Error())
+				_ = dw.queue.Nack(ev.ID, err.Error(), 3)
 			}
 		} else {
 			records := make([]models.VectorRecord, len(upsertEvents))
@@ -178,7 +178,7 @@ func (dw *DualWriter) drainReplicationBatch(ctx context.Context, limit int) {
 			if err := secondaryStore.Upsert(ctx, records); err != nil {
 				log.Printf("[replication_worker] secondary upsert error: %v", err)
 				for _, ev := range upsertEvents {
-					_ = dw.queue.Nack(ev.ID, err.Error())
+					_ = dw.queue.Nack(ev.ID, err.Error(), 3)
 				}
 			} else {
 				for _, ev := range upsertEvents {

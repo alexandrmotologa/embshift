@@ -21,7 +21,7 @@ import (
 
 func main() {
 	fmt.Println("================================================================================")
-	fmt.Println("  embshift: Zero-Downtime Migration & Concurrency Verification Simulation")
+	fmt.Println("  embshift: Zero-Downtime Migration, Canary & Concurrency Verification")
 	fmt.Println("================================================================================")
 
 	tempDir, err := os.MkdirTemp("", "embshift-sim-*")
@@ -42,11 +42,16 @@ func main() {
 	cfg.Backfill.TokensPerMinute = 10000000 // Fast simulation rate
 	cfg.Cutover.RequireZeroPendingQueue = true
 	cfg.Cutover.MaxReplicationLagMs = 200.0
+	cfg.Shadow.MinJaccardThreshold = 0.10 // Minimum semantic rank overlap threshold
 
 	legacyStore := adapter.NewMockStore("legacy-ada-002", 1536)
 	targetStore := adapter.NewMockStore("target-3-large", 3072)
 	legacyEmbedder := adapter.NewMockEmbedder("text-embedding-ada-002", 1536)
 	targetEmbedder := adapter.NewMockEmbedder("text-embedding-3-large", 3072)
+
+	// Set prompt templates and prefixes
+	legacyEmbedder.SetPrefixes("passage: ", "query: ")
+	targetEmbedder.SetPrefixes("passage: ", "query: ")
 
 	router := proxy.NewRouter(&cfg, legacyStore, targetStore, legacyEmbedder, targetEmbedder, q)
 	dualWriter := proxy.NewDualWriter(router, q)
@@ -62,15 +67,24 @@ func main() {
 
 	// Step 1: Seed 500 initial documents
 	fmt.Println("[Step 1] Seeding 500 initial documents into legacy vector store...")
+	topics := []string{
+		"distributed vector database partitioning and consensus",
+		"approximate nearest neighbor HNSW graph indexing",
+		"zero downtime dual writing migration algorithms",
+		"semantic search ranking and NDCG correlation metrics",
+		"token rate limiting and spend budget controls",
+	}
+
 	var initialDocs []models.VectorRecord
 	for i := 1; i <= 500; i++ {
-		text := fmt.Sprintf("Enterprise technical documentation chunk #%04d regarding distributed vector stores", i)
+		topic := topics[i%len(topics)]
+		text := fmt.Sprintf("%s document chunk index #%04d", topic, i)
 		vec, _, _ := legacyEmbedder.EmbedQuery(ctx, text)
 		initialDocs = append(initialDocs, models.VectorRecord{
 			ID:      fmt.Sprintf("doc-%04d", i),
 			Vector:  vec,
 			Text:    text,
-			Payload: map[string]any{"index": i},
+			Payload: map[string]any{"index": i, "topic": topic},
 		})
 	}
 	_ = legacyStore.Upsert(ctx, initialDocs)
@@ -101,8 +115,9 @@ func main() {
 				return
 			case <-ticker.C:
 				queryCount++
+				searchPhrase := topics[queryCount%len(topics)]
 				_, _ = queryMirror.Query(ctx, models.SearchQuery{
-					Text: fmt.Sprintf("search query iteration %d", queryCount),
+					Text: searchPhrase,
 					TopK: 5,
 				})
 			}
@@ -124,10 +139,11 @@ func main() {
 			case <-ticker.C:
 				writeCount++
 				docID := fmt.Sprintf("live-doc-%04d", writeCount)
+				topic := topics[writeCount%len(topics)]
 				_ = dualWriter.Upsert(ctx, []models.VectorRecord{
 					{
 						ID:   docID,
-						Text: fmt.Sprintf("Concurrent runtime write number %d while backfill is active", writeCount),
+						Text: fmt.Sprintf("%s concurrent live write #%04d", topic, writeCount),
 					},
 				})
 			}
@@ -159,7 +175,7 @@ func main() {
 	close(stopSimTraffic)
 	wg.Wait()
 
-	// Allow replication worker to drain remaining live writes
+	// Drain remaining live writes
 	for {
 		queueDepth, _ := q.GetQueueSize()
 		if queueDepth == 0 {
@@ -168,21 +184,34 @@ func main() {
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	// Step 5: Evaluate Quality Gate
-	fmt.Println("[Step 5] Checking quality gate thresholds prior to cutover...")
+	// Step 5: Test Canary Phased Routing
+	fmt.Println("[Step 5] Testing Canary Phased Routing (25% live traffic split)...")
+	_ = router.SetCanaryWeight(0.25)
+	canarySample, err := queryMirror.Query(ctx, models.SearchQuery{
+		Text: "distributed vector database",
+		TopK: 5,
+	})
+	if err != nil {
+		log.Fatalf("canary query failed: %v", err)
+	}
+	fmt.Printf("         Canary active: weight=%.2f, result count=%d, store=%s\n",
+		router.GetCanaryWeight(), len(canarySample.Records), canarySample.StoreName)
+
+	// Step 6: Evaluate Quality Gate
+	fmt.Println("[Step 6] Checking quality gate thresholds prior to cutover...")
 	report, err := qualityGate.Evaluate(ctx, legacyStore, targetStore)
 	if err != nil {
 		log.Fatalf("quality gate error: %v", err)
 	}
-	fmt.Printf("         Parity: %.2f%% | Queue Depth: %d | Eligible: %t\n",
-		report.ParityRatio*100, report.QueuePending, report.Eligible)
+	fmt.Printf("         Parity: %.2f%% | Queue Depth: %d | Avg Jaccard: %.2f%% | Eligible: %t\n",
+		report.ParityRatio*100, report.QueuePending, report.AverageJaccard*100, report.Eligible)
 
 	if !report.Eligible {
 		log.Fatalf("cutover blocked: %v", report.BlockingReasons)
 	}
 
-	// Step 6: Execute Atomic Cutover
-	fmt.Println("[Step 6] Executing atomic traffic cutover switch...")
+	// Step 7: Execute Atomic Cutover
+	fmt.Println("[Step 7] Executing atomic traffic cutover switch...")
 	manifest, err := router.ExecuteCutover()
 	if err != nil {
 		log.Fatalf("cutover failed: %v", err)
@@ -191,7 +220,7 @@ func main() {
 	fmt.Printf("         Active Primary: %s\n", router.GetActivePrimary())
 	fmt.Printf("         Cutover Manifest ID: %s (SHA-256: %s)\n", manifest.MigrationID, manifest.IntegritySHA256)
 
-	// Step 7: Memory Footprint Verification
+	// Step 8: Memory Footprint Verification
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 	allocMB := float64(m.Alloc) / 1024.0 / 1024.0

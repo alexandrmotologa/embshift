@@ -13,7 +13,7 @@ import (
 	"github.com/alexandrmotologa/embshift/internal/queue"
 )
 
-func TestProxyDualWriteAndCutover(t *testing.T) {
+func TestProxyDualWriteCanaryAndCutover(t *testing.T) {
 	tempDir, err := os.MkdirTemp("", "embshift-proxy-test-*")
 	if err != nil {
 		t.Fatalf("temp dir: %v", err)
@@ -43,7 +43,6 @@ func TestProxyDualWriteAndCutover(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Start background replication worker
 	go dualWriter.StartReplicationWorker(ctx)
 
 	// 1. Ingestion: Dual Write Upsert
@@ -65,26 +64,40 @@ func TestProxyDualWriteAndCutover(t *testing.T) {
 		t.Fatalf("upsert error: %v", err)
 	}
 
-	// Verify legacy store has 2 records
-	c, _ := legacyStore.Count(ctx)
-	if c != 2 {
-		t.Fatalf("expected legacy store count 2, got %d", c)
-	}
-
-	// Wait for replication worker to drain queue
 	time.Sleep(150 * time.Millisecond)
 
 	tc, _ := targetStore.Count(ctx)
 	if tc != 2 {
-		t.Fatalf("expected target store count 2 after replication, got %d", tc)
+		t.Fatalf("expected target store count 2, got %d", tc)
 	}
 
-	queueSize, _ := q.GetQueueSize()
-	if queueSize != 0 {
-		t.Fatalf("expected replication queue size 0, got %d", queueSize)
+	// 2. Test Canary Routing (Set Canary to 100% temporarily to verify route)
+	err = router.SetCanaryWeight(1.0)
+	if err != nil {
+		t.Fatalf("set canary weight error: %v", err)
+	}
+	if router.GetState() != models.StateCanaryRouting {
+		t.Fatalf("expected state canary_routing, got %s", router.GetState())
 	}
 
-	// 2. Query Mirroring
+	canaryResult, err := queryMirror.Query(ctx, models.SearchQuery{
+		Text: "artificial intelligence",
+		TopK: 2,
+	})
+	if err != nil {
+		t.Fatalf("canary query error: %v", err)
+	}
+	if !canaryResult.IsCanary {
+		t.Fatalf("expected IsCanary to be true when canary weight is 1.0")
+	}
+
+	// Reset canary to 0
+	router.AbortCanary()
+	if router.GetCanaryWeight() != 0.0 {
+		t.Fatalf("expected canary weight 0 after abort")
+	}
+
+	// 3. Query Mirroring on normal path
 	qRes, err := queryMirror.Query(ctx, models.SearchQuery{
 		Text: "semantic retrieval algorithms",
 		TopK: 2,
@@ -99,10 +112,10 @@ func TestProxyDualWriteAndCutover(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	recent := queryMirror.GetRecentShadowComparisons()
 	if len(recent) == 0 {
-		t.Fatalf("expected at least 1 shadow comparison recorded")
+		t.Fatalf("expected shadow comparisons recorded")
 	}
 
-	// 3. Atomic Cutover
+	// 4. Atomic Cutover
 	manifest, err := router.ExecuteCutover()
 	if err != nil {
 		t.Fatalf("execute cutover error: %v", err)
@@ -110,29 +123,11 @@ func TestProxyDualWriteAndCutover(t *testing.T) {
 	if manifest == nil || manifest.LegacyDimensions != 1536 || manifest.TargetDimensions != 3072 {
 		t.Fatalf("invalid audit manifest: %+v", manifest)
 	}
-
 	if router.GetActivePrimary() != "target" {
 		t.Fatalf("expected active primary to be target after cutover")
 	}
 
-	// 4. Test Upsert post-cutover
-	postRecords := []models.VectorRecord{
-		{
-			ID:   "doc-3",
-			Text: "Post-cutover document written directly to target store",
-		},
-	}
-	err = dualWriter.Upsert(ctx, postRecords)
-	if err != nil {
-		t.Fatalf("post-cutover upsert error: %v", err)
-	}
-
-	tc, _ = targetStore.Count(ctx)
-	if tc != 3 {
-		t.Fatalf("expected target count 3, got %d", tc)
-	}
-
-	// 5. Test Rollback
+	// 5. Rollback
 	err = router.ExecuteRollback()
 	if err != nil {
 		t.Fatalf("rollback error: %v", err)

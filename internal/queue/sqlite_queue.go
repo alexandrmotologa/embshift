@@ -10,7 +10,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// SQLiteQueue provides a durable, transactional replication event buffer in WAL mode.
+// SQLiteQueue provides a durable, transactional replication event buffer in WAL mode with DLQ support.
 type SQLiteQueue struct {
 	db *sql.DB
 	mu sync.Mutex
@@ -23,7 +23,6 @@ func NewSQLiteQueue(dbPath string) (*SQLiteQueue, error) {
 		return nil, fmt.Errorf("open sqlite db: %w", err)
 	}
 
-	// Configure connection pool for SQLite WAL mode concurrency
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 
@@ -43,6 +42,19 @@ func NewSQLiteQueue(dbPath string) (*SQLiteQueue, error) {
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_rep_events_created ON replication_events(created_at);
+
+	CREATE TABLE IF NOT EXISTS dead_letter_events (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		record_id TEXT NOT NULL,
+		operation TEXT NOT NULL,
+		payload BLOB,
+		text TEXT,
+		error_reason TEXT NOT NULL,
+		failed_at DATETIME NOT NULL,
+		attempts INTEGER NOT NULL
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_dlq_failed_at ON dead_letter_events(failed_at);
 
 	CREATE TABLE IF NOT EXISTS backfill_checkpoints (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -146,15 +158,52 @@ func (q *SQLiteQueue) Ack(eventIDs []int64) error {
 	return tx.Commit()
 }
 
-// Nack increments the attempt counter and records the error description.
-func (q *SQLiteQueue) Nack(eventID int64, errReason string) error {
+// Nack increments the attempt counter or moves poison-pill events to DLQ if maxAttempts is reached.
+func (q *SQLiteQueue) Nack(eventID int64, errReason string, maxAttempts int) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
+	if maxAttempts <= 0 {
+		maxAttempts = 3
+	}
+
+	var attempts int
+	var op, recordID, text string
+	var payload []byte
+	err := q.db.QueryRow("SELECT operation, record_id, payload, text, attempts FROM replication_events WHERE id = ?", eventID).
+		Scan(&op, &recordID, &payload, &text, &attempts)
+	if err != nil {
+		return err
+	}
+
+	if attempts+1 >= maxAttempts {
+		// Move to Dead-Letter Queue
+		tx, err := q.db.Begin()
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+
+		insertDLQ := `INSERT INTO dead_letter_events (record_id, operation, payload, text, error_reason, failed_at, attempts)
+		              VALUES (?, ?, ?, ?, ?, ?, ?)`
+		_, err = tx.Exec(insertDLQ, recordID, op, payload, text, errReason, time.Now().UTC(), attempts+1)
+		if err != nil {
+			return err
+		}
+
+		_, err = tx.Exec("DELETE FROM replication_events WHERE id = ?", eventID)
+		if err != nil {
+			return err
+		}
+
+		return tx.Commit()
+	}
+
+	// Normal retry increment
 	query := `UPDATE replication_events 
 	          SET attempts = attempts + 1, last_error = ? 
 	          WHERE id = ?`
-	_, err := q.db.Exec(query, errReason, eventID)
+	_, err = q.db.Exec(query, errReason, eventID)
 	return err
 }
 
@@ -199,6 +248,94 @@ func (q *SQLiteQueue) GetReplicationLagMs() (float64, error) {
 		lag = 0
 	}
 	return lag, nil
+}
+
+// GetDLQCount returns the number of poison-pill records in the Dead-Letter Queue.
+func (q *SQLiteQueue) GetDLQCount() (int64, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	var count int64
+	err := q.db.QueryRow("SELECT COUNT(*) FROM dead_letter_events").Scan(&count)
+	return count, err
+}
+
+// GetDLQItems retrieves sequestered items from the Dead-Letter Queue.
+func (q *SQLiteQueue) GetDLQItems(limit int) ([]models.DLQItem, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if limit <= 0 {
+		limit = 50
+	}
+
+	query := `SELECT id, record_id, operation, COALESCE(text, ''), error_reason, failed_at, attempts
+	          FROM dead_letter_events
+	          ORDER BY id DESC
+	          LIMIT ?`
+
+	rows, err := q.db.Query(query, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var items []models.DLQItem
+	for rows.Next() {
+		var item models.DLQItem
+		var failedAtStr string
+		if err := rows.Scan(&item.ID, &item.RecordID, &item.Operation, &item.Text, &item.ErrorReason, &failedAtStr, &item.Attempts); err != nil {
+			return nil, err
+		}
+		item.FailedAt, _ = time.Parse("2006-01-02 15:04:05.999999999-07:00", failedAtStr)
+		if item.FailedAt.IsZero() {
+			item.FailedAt, _ = time.Parse(time.RFC3339, failedAtStr)
+		}
+		items = append(items, item)
+	}
+
+	return items, rows.Err()
+}
+
+// RetryDLQItem moves a record from the DLQ back into the active replication queue.
+func (q *SQLiteQueue) RetryDLQItem(dlqID int64) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	var op, recordID, text string
+	var payload []byte
+	err := q.db.QueryRow("SELECT operation, record_id, payload, text FROM dead_letter_events WHERE id = ?", dlqID).
+		Scan(&op, &recordID, &payload, &text)
+	if err != nil {
+		return err
+	}
+
+	tx, err := q.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	insertQueue := `INSERT INTO replication_events (operation, record_id, payload, text, created_at, attempts)
+	                VALUES (?, ?, ?, ?, ?, 0)`
+	if _, err := tx.Exec(insertQueue, op, recordID, payload, text, time.Now().UTC()); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec("DELETE FROM dead_letter_events WHERE id = ?", dlqID); err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+// PurgeDLQItem permanently removes a record from the DLQ.
+func (q *SQLiteQueue) PurgeDLQItem(dlqID int64) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	_, err := q.db.Exec("DELETE FROM dead_letter_events WHERE id = ?", dlqID)
+	return err
 }
 
 // MarkDocumentMigrated stores a document ID in the backfill checkpoint store.

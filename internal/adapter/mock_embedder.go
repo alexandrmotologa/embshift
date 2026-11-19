@@ -6,13 +6,17 @@ import (
 	"encoding/binary"
 	"math"
 	"strings"
+	"sync"
 )
 
 // MockEmbedder produces deterministic unit-normalized float32 vectors for testing and simulation.
 type MockEmbedder struct {
-	modelName  string
-	dimensions int
-	seed       uint64
+	mu             sync.RWMutex
+	modelName      string
+	dimensions     int
+	seed           uint64
+	documentPrefix string
+	queryPrefix    string
 }
 
 // NewMockEmbedder creates an embedder projecting text into fixed-dimension unit vectors.
@@ -34,13 +38,24 @@ func (m *MockEmbedder) Dimensions() int {
 	return m.dimensions
 }
 
+func (m *MockEmbedder) SetPrefixes(documentPrefix, queryPrefix string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.documentPrefix = documentPrefix
+	m.queryPrefix = queryPrefix
+}
+
 func (m *MockEmbedder) EmbedTexts(ctx context.Context, texts []string) ([][]float32, int64, error) {
+	m.mu.RLock()
+	prefix := m.documentPrefix
+	m.mu.RUnlock()
+
 	vectors := make([][]float32, len(texts))
 	var totalTokens int64
 	for i, text := range texts {
-		vectors[i] = m.generateVector(text)
-		// Approximate token count: 1 token per 4 characters or min 1
-		tok := int64(len(text) / 4)
+		formatted := prefix + text
+		vectors[i] = m.generateVector(formatted)
+		tok := int64(len(formatted) / 4)
 		if tok < 1 {
 			tok = 1
 		}
@@ -50,8 +65,13 @@ func (m *MockEmbedder) EmbedTexts(ctx context.Context, texts []string) ([][]floa
 }
 
 func (m *MockEmbedder) EmbedQuery(ctx context.Context, text string) ([]float32, int64, error) {
-	v := m.generateVector(text)
-	tok := int64(len(text) / 4)
+	m.mu.RLock()
+	prefix := m.queryPrefix
+	m.mu.RUnlock()
+
+	formatted := prefix + text
+	v := m.generateVector(formatted)
+	tok := int64(len(formatted) / 4)
 	if tok < 1 {
 		tok = 1
 	}
@@ -69,14 +89,12 @@ func (m *MockEmbedder) generateVector(text string) []float32 {
 		h := sha256.Sum256([]byte(word))
 		wordHash := binary.BigEndian.Uint64(h[:8]) ^ m.seed
 		for i := 0; i < m.dimensions; i++ {
-			// Linear congruential generator step
 			wordHash = wordHash*6364136223846793005 + 1442695040888963407
 			val := float32(float64(int64(wordHash)%1000) / 1000.0)
 			vec[i] += val
 		}
 	}
 
-	// L2 normalization to unit vector
 	var sumSq float64
 	for _, val := range vec {
 		sumSq += float64(val * val)

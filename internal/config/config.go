@@ -51,6 +51,8 @@ type EmbedderModelConfig struct {
 	Model                    string  `yaml:"model"`
 	Dimensions               int     `yaml:"dimensions"`
 	PricePerMillionTokensUSD float64 `yaml:"price_per_million_tokens_usd"`
+	DocumentPrefix           string  `yaml:"document_prefix"` // e.g. "passage: " or "Represent the document for retrieval: "
+	QueryPrefix              string  `yaml:"query_prefix"`    // e.g. "query: " or "Represent the query: "
 }
 
 // BackfillConfig tunes batch processing, concurrency, and token spend limits.
@@ -61,6 +63,7 @@ type BackfillConfig struct {
 	TokensPerMinute   int     `yaml:"tokens_per_minute"`
 	MaxBudgetUSD      float64 `yaml:"max_budget_usd"`
 	TextField         string  `yaml:"text_field"`
+	MaxRetryAttempts  int     `yaml:"max_retry_attempts"` // After N attempts, move to Dead-Letter Queue
 }
 
 // ShadowConfig controls production query mirroring and quality verification.
@@ -77,6 +80,8 @@ type CutoverConfig struct {
 	MaxReplicationLagMs      float64 `yaml:"max_replication_lag_ms"`
 	RequireZeroPendingQueue  bool    `yaml:"require_zero_pending_queue"`
 	EnableReverseReplication bool    `yaml:"enable_reverse_replication"`
+	InitialCanaryWeight      float64 `yaml:"initial_canary_weight"` // Initial canary traffic (0.0 to 1.0)
+	MaxCanaryErrorRate       float64 `yaml:"max_canary_error_rate"` // e.g. 0.05 (5%) triggers auto-abort
 }
 
 // StorageConfig specifies persistence settings for the local SQLite state database.
@@ -112,12 +117,16 @@ func DefaultConfig() Config {
 				Model:                    "text-embedding-ada-002",
 				Dimensions:               1536,
 				PricePerMillionTokensUSD: 0.10,
+				DocumentPrefix:           "",
+				QueryPrefix:              "",
 			},
 			Target: EmbedderModelConfig{
 				Type:                     "mock",
 				Model:                    "text-embedding-3-large",
 				Dimensions:               3072,
 				PricePerMillionTokensUSD: 0.13,
+				DocumentPrefix:           "",
+				QueryPrefix:              "",
 			},
 		},
 		Backfill: BackfillConfig{
@@ -127,6 +136,7 @@ func DefaultConfig() Config {
 			TokensPerMinute:   1000000,
 			MaxBudgetUSD:      50.0,
 			TextField:         "text",
+			MaxRetryAttempts:  3,
 		},
 		Shadow: ShadowConfig{
 			SampleRatio:         0.25,
@@ -139,6 +149,8 @@ func DefaultConfig() Config {
 			MaxReplicationLagMs:      100.0,
 			RequireZeroPendingQueue:  true,
 			EnableReverseReplication: true,
+			InitialCanaryWeight:      0.0,
+			MaxCanaryErrorRate:       0.05,
 		},
 		Storage: StorageConfig{
 			SQLitePath: "embshift.db",

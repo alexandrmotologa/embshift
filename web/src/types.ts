@@ -3,6 +3,7 @@ export type MigrationState =
   | 'backfilling'
   | 'paused'
   | 'shadow_testing'
+  | 'canary_routing'
   | 'ready_for_cutover'
   | 'cutover_complete'
   | 'rolled_back'
@@ -20,20 +21,34 @@ export interface ShadowComparison {
   legacy_results: ScoredRecord[]
   target_results: ScoredRecord[]
   jaccard_similarity: number
+  ndcg_at_k: number
   legacy_latency_ms: number
   target_latency_ms: number
   timestamp: string
 }
 
+export interface DLQItem {
+  id: number
+  record_id: string
+  operation: string
+  text?: string
+  payload_json?: string
+  error_reason: string
+  failed_at: string
+  attempts: number
+}
+
 export interface MigrationTelemetry {
   state: MigrationState
   active_primary: 'legacy' | 'target'
+  canary_weight: number
   legacy_count: number
   target_count: number
   backfilled_count: number
   parity_ratio: number
   replication_lag_ms: number
   replication_queue_size: number
+  dlq_count: number
   tokens_consumed: number
   estimated_cost_usd: number
   cost_limit_usd: number

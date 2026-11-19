@@ -83,6 +83,18 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/simulate/insert", s.handleSimulateInsert)
 	mux.HandleFunc("GET /api/events", s.broadcaster.HandleSSE)
 
+	// Observability & Metrics
+	mux.HandleFunc("GET /metrics", s.HandleMetrics)
+
+	// Canary Traffic Controls
+	mux.HandleFunc("POST /api/canary/set", s.handleCanarySet)
+	mux.HandleFunc("POST /api/canary/abort", s.handleCanaryAbort)
+
+	// Dead-Letter Queue (DLQ) Management
+	mux.HandleFunc("GET /api/dlq", s.handleDLQList)
+	mux.HandleFunc("POST /api/dlq/retry", s.handleDLQRetry)
+	mux.HandleFunc("POST /api/dlq/purge", s.handleDLQPurge)
+
 	// Embedded Static UI Assets
 	s.mu.RLock()
 	staticFS := s.staticFS
@@ -313,6 +325,73 @@ func (s *Server) handleSimulateInsert(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleCanarySet(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Weight float64 `json:"weight"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if err := s.router.SetCanaryWeight(body.Weight); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	s.broadcaster.Broadcast("canary", map[string]any{"canary_weight": body.Weight})
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "canary_weight": body.Weight})
+}
+
+func (s *Server) handleCanaryAbort(w http.ResponseWriter, r *http.Request) {
+	s.router.AbortCanary()
+	s.broadcaster.Broadcast("canary", map[string]any{"canary_weight": 0.0})
+	writeJSON(w, http.StatusOK, map[string]string{"status": "canary_aborted"})
+}
+
+func (s *Server) handleDLQList(w http.ResponseWriter, r *http.Request) {
+	items, err := s.queue.GetDLQItems(100)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	count, _ := s.queue.GetDLQCount()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"count": count,
+		"items": items,
+	})
+}
+
+func (s *Server) handleDLQRetry(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ID int64 `json:"id"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	if body.ID <= 0 {
+		http.Error(w, "valid DLQ id required", http.StatusBadRequest)
+		return
+	}
+	if err := s.queue.RetryDLQItem(body.ID); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "requeued"})
+}
+
+func (s *Server) handleDLQPurge(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ID int64 `json:"id"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	if body.ID <= 0 {
+		http.Error(w, "valid DLQ id required", http.StatusBadRequest)
+		return
+	}
+	if err := s.queue.PurgeDLQItem(body.ID); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "purged"})
+}
+
 func (s *Server) collectTelemetry(ctx context.Context) (*models.MigrationTelemetry, error) {
 	legacyStore := s.router.GetPrimaryStore()
 	targetStore := s.router.GetSecondaryStore()
@@ -330,6 +409,7 @@ func (s *Server) collectTelemetry(ctx context.Context) (*models.MigrationTelemet
 
 	lagMs, _ := s.queue.GetReplicationLagMs()
 	queueSize, _ := s.queue.GetQueueSize()
+	dlqCount, _ := s.queue.GetDLQCount()
 	tokens, spent, _ := s.orchestrator.GetBudgetStats()
 	avgJaccard, shadowCount, _ := s.queue.GetAverageJaccard()
 
@@ -344,12 +424,14 @@ func (s *Server) collectTelemetry(ctx context.Context) (*models.MigrationTelemet
 	return &models.MigrationTelemetry{
 		State:                s.router.GetState(),
 		ActivePrimary:        s.router.GetActivePrimary(),
+		CanaryWeight:         s.router.GetCanaryWeight(),
 		LegacyCount:          legacyCount,
 		TargetCount:          targetCount,
 		BackfilledCount:      migratedCount,
 		ParityRatio:          parity,
 		ReplicationLagMs:     lagMs,
 		ReplicationQueueSize: queueSize,
+		DLQCount:             dlqCount,
 		TokensConsumed:       tokens,
 		EstimatedCostUSD:     spent,
 		CostLimitUSD:         s.cfg.Backfill.MaxBudgetUSD,

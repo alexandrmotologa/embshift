@@ -10,6 +10,7 @@ const (
 	StateBackfilling      MigrationState = "backfilling"
 	StatePaused           MigrationState = "paused"
 	StateShadowTesting    MigrationState = "shadow_testing"
+	StateCanaryRouting    MigrationState = "canary_routing"
 	StateReadyForCutover  MigrationState = "ready_for_cutover"
 	StateCutoverComplete  MigrationState = "cutover_complete"
 	StateRolledBack       MigrationState = "rolled_back"
@@ -47,6 +48,7 @@ type SearchResult struct {
 	LatencyMs float64        `json:"latency_ms"`
 	StoreName string         `json:"store_name"`
 	ModelName string         `json:"model_name"`
+	IsCanary  bool           `json:"is_canary,omitempty"`
 }
 
 // ReplicationEvent represents an operation queued for asynchronous target replication.
@@ -61,6 +63,18 @@ type ReplicationEvent struct {
 	LastError string    `json:"last_error,omitempty"`
 }
 
+// DLQItem represents a poisoned or failing record sequestered in the Dead-Letter Queue.
+type DLQItem struct {
+	ID          int64     `json:"id"`
+	RecordID    string    `json:"record_id"`
+	Operation   string    `json:"operation"`
+	Text        string    `json:"text,omitempty"`
+	PayloadJSON string    `json:"payload_json,omitempty"`
+	ErrorReason string    `json:"error_reason"`
+	FailedAt    time.Time `json:"failed_at"`
+	Attempts    int       `json:"attempts"`
+}
+
 // ShadowComparison records the side-by-side search performance on a mirrored query.
 type ShadowComparison struct {
 	QueryID           string         `json:"query_id"`
@@ -68,6 +82,7 @@ type ShadowComparison struct {
 	LegacyResults     []ScoredRecord `json:"legacy_results"`
 	TargetResults     []ScoredRecord `json:"target_results"`
 	JaccardSimilarity float64        `json:"jaccard_similarity"`
+	NDCGAtK           float64        `json:"ndcg_at_k"`
 	LegacyLatencyMs   float64        `json:"legacy_latency_ms"`
 	TargetLatencyMs   float64        `json:"target_latency_ms"`
 	Timestamp         time.Time      `json:"timestamp"`
@@ -75,22 +90,24 @@ type ShadowComparison struct {
 
 // MigrationTelemetry holds real-time counters and operational status.
 type MigrationTelemetry struct {
-	State                MigrationState `json:"state"`
-	ActivePrimary        string         `json:"active_primary"`
-	LegacyCount          int64          `json:"legacy_count"`
-	TargetCount          int64          `json:"target_count"`
-	BackfilledCount      int64          `json:"backfilled_count"`
-	ParityRatio          float64        `json:"parity_ratio"`
-	ReplicationLagMs     float64        `json:"replication_lag_ms"`
-	ReplicationQueueSize int64          `json:"replication_queue_size"`
-	TokensConsumed       int64          `json:"tokens_consumed"`
-	EstimatedCostUSD     float64        `json:"estimated_cost_usd"`
-	CostLimitUSD         float64        `json:"cost_limit_usd"`
-	AverageJaccard       float64        `json:"average_jaccard"`
-	EvaluatedQueries     int64          `json:"evaluated_queries"`
-	CutoverEligible      bool           `json:"cutover_eligible"`
-	CutoverAt            *time.Time     `json:"cutover_at,omitempty"`
-	ReverseReplication   bool           `json:"reverse_replication"`
+	State                MigrationState     `json:"state"`
+	ActivePrimary        string             `json:"active_primary"`
+	CanaryWeight         float64            `json:"canary_weight"`
+	LegacyCount          int64              `json:"legacy_count"`
+	TargetCount          int64              `json:"target_count"`
+	BackfilledCount      int64              `json:"backfilled_count"`
+	ParityRatio          float64            `json:"parity_ratio"`
+	ReplicationLagMs     float64            `json:"replication_lag_ms"`
+	ReplicationQueueSize int64              `json:"replication_queue_size"`
+	DLQCount             int64              `json:"dlq_count"`
+	TokensConsumed       int64              `json:"tokens_consumed"`
+	EstimatedCostUSD     float64            `json:"estimated_cost_usd"`
+	CostLimitUSD         float64            `json:"cost_limit_usd"`
+	AverageJaccard       float64            `json:"average_jaccard"`
+	EvaluatedQueries     int64              `json:"evaluated_queries"`
+	CutoverEligible      bool               `json:"cutover_eligible"`
+	CutoverAt            *time.Time         `json:"cutover_at,omitempty"`
+	ReverseReplication   bool               `json:"reverse_replication"`
 	RecentShadowQueries  []ShadowComparison `json:"recent_shadow_queries,omitempty"`
 }
 

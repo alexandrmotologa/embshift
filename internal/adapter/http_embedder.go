@@ -8,16 +8,20 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
 // HTTPEmbedder communicates with standard embedding endpoints (OpenAI, Voyage AI, Ollama).
 type HTTPEmbedder struct {
-	endpoint   string
-	apiKey     string
-	model      string
-	dimensions int
-	client     *http.Client
+	mu             sync.RWMutex
+	endpoint       string
+	apiKey         string
+	model          string
+	dimensions     int
+	documentPrefix string
+	queryPrefix    string
+	client         *http.Client
 }
 
 // NewHTTPEmbedder initializes an HTTP embedder client.
@@ -48,14 +52,33 @@ func (h *HTTPEmbedder) Dimensions() int {
 	return h.dimensions
 }
 
+func (h *HTTPEmbedder) SetPrefixes(documentPrefix, queryPrefix string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.documentPrefix = documentPrefix
+	h.queryPrefix = queryPrefix
+}
+
 func (h *HTTPEmbedder) EmbedTexts(ctx context.Context, texts []string) ([][]float32, int64, error) {
 	if len(texts) == 0 {
 		return [][]float32{}, 0, nil
 	}
 
+	h.mu.RLock()
+	prefix := h.documentPrefix
+	h.mu.RUnlock()
+
+	preparedTexts := texts
+	if prefix != "" {
+		preparedTexts = make([]string, len(texts))
+		for i, t := range texts {
+			preparedTexts[i] = prefix + t
+		}
+	}
+
 	reqBody := map[string]any{
 		"model": h.model,
-		"input": texts,
+		"input": preparedTexts,
 	}
 	if h.dimensions > 0 && strings.Contains(h.model, "text-embedding-3") {
 		reqBody["dimensions"] = h.dimensions
@@ -111,7 +134,12 @@ func (h *HTTPEmbedder) EmbedTexts(ctx context.Context, texts []string) ([][]floa
 }
 
 func (h *HTTPEmbedder) EmbedQuery(ctx context.Context, text string) ([]float32, int64, error) {
-	vecs, tokens, err := h.EmbedTexts(ctx, []string{text})
+	h.mu.RLock()
+	prefix := h.queryPrefix
+	h.mu.RUnlock()
+
+	preparedQuery := prefix + text
+	vecs, tokens, err := h.EmbedTexts(ctx, []string{preparedQuery})
 	if err != nil {
 		return nil, 0, err
 	}

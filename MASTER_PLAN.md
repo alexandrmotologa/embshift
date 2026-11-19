@@ -21,6 +21,9 @@ embshift is an autonomous vector database migration proxy and shadow re-embeddin
 - Transparent dual-write proxy. Sits between application services and vector stores. Commits writes and deletes synchronously to the active primary store while asynchronously staging updates to the target store.
 - Rate-limited backfill orchestrator. Iterates through legacy documents, generating replacement embeddings through controlled concurrency pools with token budget pacing.
 - Production shadow query evaluation. Mirrors live queries to both the legacy and target indices, computing rank overlap (Jaccard similarity), Mean Reciprocal Rank (MRR), and NDCG in real time without increasing client latency.
+- Phased canary traffic routing. Allows gradual read splitting (0% to 100%) with automated abort guards on error rate spikes.
+- Dead-Letter Queue (DLQ). Sequewsters malformed or oversized poison-pill documents with live inspection and retry in the web studio.
+- Prometheus observability. Exports `/metrics` for platform monitoring in Kubernetes and Grafana.
 - Atomic zero-downtime cutover. Switches live routing to the target store once document parity reaches 100% and quality thresholds pass.
 - Reversible rollback support. Keeps a reverse dual-write buffer active after cutover, allowing immediate rollback if retrieval anomalies appear.
 - Embedded React 19 Migration Studio. Provides a single-binary web cockpit showing backfill progress, replication lag, spend against budget, and side-by-side search results.
@@ -65,6 +68,7 @@ embshift is an autonomous vector database migration proxy and shadow re-embeddin
        |  |          Shadow Query Comparator & Quality Gate       |  |
        |  |  * Mirrors configurable fraction of live queries      |  |
        |  |  * Computes rank correlation & retrieval parity       |  |
+       |  |  * Phased Canary traffic splitting (0% -> 100%)       |  |
        |  +-------------------------------------------------------+  |
        |                              |                              |
        |         Parity = 100% && Quality Gate Passed                |
@@ -81,7 +85,9 @@ embshift is an autonomous vector database migration proxy and shadow re-embeddin
        |                  Control and Inspection Surfaces            |
        |  1. Embedded React 19 Migration Studio (HTTP :8787)         |
        |  2. Real-Time Backfill Progress & Dual-Write Lag Gauge      |
-       |  3. Non-Repudiable Migration Audit Manifest (audit.json)    |
+       |  3. Dead-Letter Queue (DLQ) Inspector & Retry Console       |
+       |  4. Prometheus Metrics Exporter (/metrics)                  |
+       |  5. Non-Repudiable Migration Audit Manifest (audit.json)    |
        +-------------------------------------------------------------+
 ```
 
@@ -105,147 +111,76 @@ The system computes a rolling average semantic overlap across live production tr
 
 ---
 
-## 4. Repository Structure
-
-```
-embshift/
-├── cmd/
-│   └── embshift/
-│       └── main.go                 # CLI entry point: proxy, backfill, cutover, studio, demo
-├── internal/
-│   ├── config/
-│   │   ├── config.go               # Configuration parser for vector stores and models
-│   │   └── schema.go               # Model specifications, budget caps, rate limits
-│   ├── models/
-│   │   └── types.go                # Core domain types: Record, Vector, Query, SearchResult
-│   ├── adapter/
-│   │   ├── store.go                # Unified VectorStore interface
-│   │   ├── embedder.go             # Unified Embedder interface
-│   │   ├── mock_store.go           # In-memory vector store for testing and simulation
-│   │   ├── mock_embedder.go        # Deterministic embedder for tests
-│   │   ├── qdrant.go               # Qdrant HTTP REST client
-│   │   ├── pgvector.go             # PostgreSQL pgvector client
-│   │   ├── pinecone.go             # Pinecone data plane REST client
-│   │   └── http_embedder.go        # OpenAI and Voyage compatible embedding client
-│   ├── queue/
-│   │   └── sqlite_queue.go         # Pure-Go SQLite WAL queue for shadow replication
-│   ├── proxy/
-│   │   ├── router.go               # Thread-safe atomic cutover router
-│   │   ├── dual_write.go           # Synchronous write with async shadow enqueue
-│   │   └── query_mirror.go         # Non-blocking query splitter
-│   ├── backfill/
-│   │   ├── orchestrator.go         # Backfill lifecycle and chunk iterator
-│   │   ├── checkpoint.go           # Checkpoint state store
-│   │   └── budget.go               # Token bucket rate limiter and dollar budget regulator
-│   ├── shadow/
-│   │   ├── evaluator.go            # Compares retrieval rankings between stores
-│   │   └── parity.go               # Real-time parity calculator
-│   └── server/
-│       ├── api.go                  # REST API for migration control and metrics
-│       ├── sse.go                  # Server-Sent Events stream for live telemetry
-│       └── embed.go                # Embedded React 19 static assets (//go:embed)
-├── web/
-│   ├── index.html
-│   ├── package.json
-│   ├── tsconfig.json
-│   ├── vite.config.ts
-│   └── src/
-│       ├── main.tsx
-│       ├── App.tsx
-│       ├── components/
-│       │   ├── MigrationProgressBar.tsx
-│       │   ├── DualWriteLagGauge.tsx
-│       │   ├── ShadowQueryView.tsx
-│       │   ├── SpendTracker.tsx
-│       │   ├── CutoverButton.tsx
-│       │   ├── LiveEventFeed.tsx
-│       │   └── QuerySimulator.tsx
-│       └── pages/
-│           └── Dashboard.tsx
-├── examples/
-│   ├── embshift.yaml               # Sample production configuration
-│   └── simulation.go               # Standalone test runner
-├── docs/
-│   ├── ARCHITECTURE.md
-│   ├── RUNBOOK.md
-│   └── BENCHMARKS.md
-├── Makefile
-├── go.mod
-├── go.sum
-├── LICENSE
-└── README.md
-```
-
----
-
-## 5. Detailed Implementation Tasks
+## 4. Implementation Tasks Status
 
 ### Task 1: Foundation, Domain Models, and Configuration
 - [x] Initialize Git repository, configure GitHub remote, and set metadata topics.
-- [ ] Initialize Go 1.22+ module (`github.com/alexandrmotologa/embshift`).
-- [ ] Define core domain types in `internal/models/types.go` (VectorRecord, SearchQuery, SearchResult, MigrationStatus, ShadowMetric).
-- [ ] Build configuration parser in `internal/config` supporting YAML, environment variables, and defaults.
-- [ ] Define VectorStore and Embedder interfaces in `internal/adapter`.
+- [x] Initialize Go 1.22+ module (`github.com/alexandrmotologa/embshift`).
+- [x] Define core domain types in `internal/models/types.go` (VectorRecord, SearchQuery, SearchResult, MigrationStatus, DLQItem).
+- [x] Build configuration parser in `internal/config` supporting YAML, environment variables, and defaults.
+- [x] Define VectorStore and Embedder interfaces in `internal/adapter`.
 
 ### Task 2: Vector Store and Embedding Adapters
-- [ ] Implement `MockStore` with cosine similarity, payload filtering, and cursor pagination.
-- [ ] Implement `MockEmbedder` with deterministic text hash projections for testing.
-- [ ] Implement `QdrantStore` using Qdrant REST API v1.
-- [ ] Implement `PgVectorStore` using PostgreSQL vector extension conventions.
-- [ ] Implement `PineconeStore` using Pinecone REST data plane API.
-- [ ] Implement `HTTPEmbedder` supporting OpenAI and Voyage AI embedding endpoints.
+- [x] Implement `MockStore` with cosine similarity, payload filtering, and cursor pagination.
+- [x] Implement `MockEmbedder` with deterministic text hash projections for testing.
+- [x] Implement `QdrantStore` using Qdrant REST API v1.
+- [x] Implement `PgVectorStore` using PostgreSQL vector extension conventions.
+- [x] Implement `PineconeStore` using Pinecone REST data plane API.
+- [x] Implement `HTTPEmbedder` supporting OpenAI and Voyage AI embedding endpoints with prefix templates.
 
-### Task 3: Durable Replication Queue
-- [ ] Implement zero-CGO SQLite WAL replication queue (`internal/queue/sqlite_queue.go`).
-- [ ] Handle enqueue, dequeue batch, acknowledge, dead-letter retry, and queue depth inspection.
-- [ ] Write unit tests verifying persistent message durability across restarts.
+### Task 3: Durable Replication Queue & Dead-Letter Handling
+- [x] Implement zero-CGO SQLite WAL replication queue (`internal/queue/sqlite_queue.go`).
+- [x] Implement Dead-Letter Queue (DLQ) table with poison-pill isolation after max retries.
+- [x] Handle enqueue, dequeue batch, acknowledge, retry, purge, and lag inspection.
+- [x] Write unit tests verifying persistent message durability across restarts.
 
-### Task 4: Dual-Writing Proxy Engine
-- [ ] Build proxy HTTP server handling `/v1/vectors/upsert`, `/v1/vectors/delete`, and `/v1/vectors/query`.
-- [ ] Implement synchronous commit to active primary and asynchronous enqueue to shadow buffer.
-- [ ] Implement background replication worker draining the queue and writing to target.
-- [ ] Compute real-time replication lag in milliseconds and pending queue count.
+### Task 4: Dual-Writing Proxy Engine & Canary Routing
+- [x] Build proxy HTTP server handling `/v1/vectors/upsert`, `/v1/vectors/delete`, and `/v1/vectors/query`.
+- [x] Implement synchronous commit to active primary and asynchronous enqueue to shadow buffer.
+- [x] Implement background replication worker draining the queue and writing to target.
+- [x] Implement phased Canary read traffic splitting (0% to 100%) with auto-abort guards.
 
 ### Task 5: Rate-Limited Backfill Orchestrator
-- [ ] Implement chunk iterator reading records from legacy store without locking.
-- [ ] Build token bucket rate limiter (RPM and TPM limits) with exponential backoff on HTTP 429.
-- [ ] Build spend regulator tracking cumulative token usage against configured dollar caps.
-- [ ] Implement persistent checkpointing in SQLite to allow pause and resume.
+- [x] Implement chunk iterator reading records from legacy store without locking.
+- [x] Build token bucket rate limiter (RPM and TPM limits) with exponential backoff on HTTP 429.
+- [x] Build spend regulator tracking cumulative token usage against configured dollar caps.
+- [x] Implement persistent checkpointing in SQLite to allow pause and resume.
 
 ### Task 6: Shadow Query Evaluation and Parity Engine
-- [ ] Implement non-blocking query mirror copying production search requests.
-- [ ] Query target store using target embedding model concurrently with primary search.
-- [ ] Calculate Jaccard@K overlap, Rank Correlation, and latency deltas.
-- [ ] Calculate continuous document parity ratio (rho_parity).
-- [ ] Implement automated quality gate checking minimum parity, minimum overlap, and zero lag.
+- [x] Implement non-blocking query mirror copying production search requests.
+- [x] Calculate Jaccard@K overlap, NDCG@K gain, and latency deltas.
+- [x] Calculate continuous document parity ratio (rho_parity).
+- [x] Implement automated quality gate checking minimum parity, minimum overlap, and zero lag.
 
 ### Task 7: Atomic Cutover and Reversible Rollback
-- [ ] Implement thread-safe atomic pointer router for zero-downtime traffic switching.
-- [ ] Enforce precondition checks before cutover (100% parity, zero lag, quality gate passed).
-- [ ] Support post-cutover reverse dual-writing (target -> legacy) for safe rollback.
-- [ ] Generate cryptographically verified migration audit report (`audit.json`).
+- [x] Implement thread-safe atomic pointer router for zero-downtime traffic switching.
+- [x] Enforce precondition checks before cutover (100% parity, zero lag, quality gate passed).
+- [x] Support post-cutover reverse dual-writing (target -> legacy) for safe rollback.
+- [x] Generate cryptographically verified migration audit report (`audit.json`).
 
-### Task 8: Management REST API and Server-Sent Events
-- [ ] Build management API endpoints: `/api/status`, `/api/config`, `/api/backfill/start`, `/api/backfill/pause`, `/api/cutover`, `/api/rollback`, `/api/audit`, `/api/query`.
-- [ ] Build SSE stream `/api/events` broadcasting state updates, metrics, and live shadow comparisons.
+### Task 8: Management REST API, SSE, and Prometheus Exporter
+- [x] Build management API endpoints: `/api/status`, `/api/backfill/start`, `/api/backfill/pause`, `/api/cutover`, `/api/rollback`, `/api/audit`, `/api/canary/set`, `/api/dlq`.
+- [x] Build Prometheus metrics endpoint (`GET /metrics`).
+- [x] Build SSE stream `/api/events` broadcasting state updates, metrics, and live shadow comparisons.
 
 ### Task 9: Embedded React 19 Migration Studio
-- [ ] Scaffold React 19 application with Vite, TypeScript, and Tailwind CSS in `web/`.
-- [ ] Build Dashboard components:
+- [x] Scaffold React 19 application with Vite, TypeScript, and Tailwind CSS in `web/`.
+- [x] Build Dashboard components:
   - MigrationProgressBar with ETA calculation.
   - DualWriteLagGauge displaying milliseconds and queue depth.
-  - ShadowQueryView displaying side-by-side search results.
+  - CanarySlider for progressive read splitting.
+  - DLQInspector for managing sequestered poison-pill documents.
+  - ShadowQueryView with semantic drift categorization (High, Moderate, Strong).
   - SpendTracker showing budget consumption.
   - CutoverButton with double-confirm safety lock.
   - QuerySimulator for testing live searches.
-  - LiveEventFeed for operational event logging.
-- [ ] Build and embed assets into Go binary with `//go:embed`.
+- [x] Build and embed assets into Go binary with `//go:embed`.
 
 ### Task 10: End-to-End Simulation, Testing, and Verification
-- [ ] Build `embshift demo` CLI command running an automated end-to-end migration simulation.
-- [ ] Write unit and integration test suite covering proxy, backfill, shadow eval, and cutover.
-- [ ] Verify memory footprint remains under 20MB RAM under load.
+- [x] Build `embshift demo` CLI command running an automated end-to-end migration simulation.
+- [x] Write unit and integration test suite covering queue, proxy, backfill, shadow eval, and server.
+- [x] Verify memory footprint remains under 20MB RAM under load (measured: 10.98MB).
 
 ### Task 11: Documentation and Runbooks
-- [ ] Write humanized `README.md` with zero AI clichés, clear architecture, and complete usage guides.
-- [ ] Create `docs/ARCHITECTURE.md`, `docs/RUNBOOK.md`, and `docs/BENCHMARKS.md`.
+- [x] Write humanized `README.md` with zero AI clichés, clear architecture, and complete usage guides.
+- [x] Create `docs/ARCHITECTURE.md`, `docs/RUNBOOK.md`, and `docs/BENCHMARKS.md`.

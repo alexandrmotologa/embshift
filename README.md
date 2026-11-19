@@ -38,6 +38,7 @@ Zero-downtime vector database migration proxy, dual-write engine, and shadow re-
        |  |          Shadow Query Comparator & Quality Gate       |  |
        |  |  * Mirrors configurable fraction of live queries      |  |
        |  |  * Computes rank correlation & retrieval parity       |  |
+       |  |  * Phased Canary traffic splitting (0% -> 100%)       |  |
        |  +-------------------------------------------------------+  |
        |                              |                              |
        |         Parity = 100% && Quality Gate Passed                |
@@ -54,7 +55,9 @@ Zero-downtime vector database migration proxy, dual-write engine, and shadow re-
        |                  Control and Inspection Surfaces            |
        |  1. Embedded React 19 Migration Studio (HTTP :8787)         |
        |  2. Real-Time Backfill Progress & Dual-Write Lag Gauge      |
-       |  3. Non-Repudiable Migration Audit Manifest (audit.json)    |
+       |  3. Dead-Letter Queue (DLQ) Inspector & Poison-Pill Retry   |
+       |  4. Prometheus Metrics Exporter (HTTP :8080/metrics)        |
+       |  5. Non-Repudiable Migration Audit Manifest (audit.json)    |
        +-------------------------------------------------------------+
 ```
 
@@ -73,6 +76,10 @@ embshift resolves these issues by acting as a transparent proxy that coordinates
 - Transparent Dual-Writing Proxy: Commits writes and deletes synchronously to the active primary store while asynchronously staging updates to the target store via an embedded SQLite WAL queue.
 - Rate-Limited Backfill Orchestrator: Traverses legacy collections with cursor pagination, pacing embedding API requests through a token bucket rate limiter with dollar budget caps.
 - Production Shadow Query Evaluation: Mirrors a configurable fraction of live search traffic to the target store, computing Jaccard similarity and NDCG without adding latency to client responses.
+- Phased Canary Traffic Routing: Progressively routes read traffic (0% to 100%) to the target index with automated abort guards triggered on error rate anomalies.
+- Dead-Letter Queue (DLQ) & Poison-Pill Inspector: Sequewsters corrupted or oversized documents after retry thresholds, allowing live inspection and retry from the web studio.
+- Asymmetric Prefix & Template Engine: Supports prompt prefixes required by modern embedding architectures (such as `passage: ` and `query: ` for Voyage, BGE, and E5 models).
+- Prometheus Observability Exporter: Serves `/metrics` in the standard exposition format for immediate ingestion by Prometheus, Datadog, or Grafana.
 - Atomic Zero-Downtime Cutover: Executes an in-memory pointer swap to reroute production traffic once corpus parity reaches 100% and quality gates pass.
 - Reverse Dual-Writing Rollback: Automatically replicates updates backward from target to legacy post-cutover, allowing an immediate one-click rollback if anomalies arise.
 - Embedded React 19 Cockpit: Delivers a real-time web interface over Server-Sent Events (SSE) inside a single Go binary consuming under 20MB of RAM.
@@ -104,7 +111,7 @@ cd embshift
 go run ./cmd/embshift demo
 ```
 
-Open your browser to `http://localhost:8787` to monitor backfill progress, replication lag, and execute the atomic cutover.
+Open your browser to `http://localhost:8787` to monitor backfill progress, replication lag, canary traffic, and execute the atomic cutover.
 
 ### 2. Run the Verification Test Suite
 Execute unit tests across the queue, proxy, backfill orchestrator, shadow evaluator, and REST server:
@@ -163,6 +170,8 @@ embedder:
     api_key: "sk-..."
     model: "text-embedding-ada-002"
     dimensions: 1536
+    document_prefix: ""
+    query_prefix: ""
   target:
     type: "openai"
     endpoint: "https://api.openai.com/v1"
@@ -170,6 +179,8 @@ embedder:
     model: "text-embedding-3-large"
     dimensions: 3072
     price_per_million_tokens_usd: 0.13
+    document_prefix: "passage: "
+    query_prefix: "query: "
 
 backfill:
   batch_size: 100
@@ -178,6 +189,7 @@ backfill:
   tokens_per_minute: 1000000
   max_budget_usd: 50.00
   text_field: "text"
+  max_retry_attempts: 3 # Move poison pills to DLQ after 3 failures
 
 shadow:
   sample_ratio: 0.25 # Mirror 25% of live production search requests
@@ -189,6 +201,8 @@ cutover:
   max_replication_lag_ms: 100.0
   require_zero_pending_queue: true
   enable_reverse_replication: true
+  initial_canary_weight: 0.0 # 0% canary traffic initially
+  max_canary_error_rate: 0.05 # Auto-abort canary on > 5% errors
 
 storage:
   sqlite_path: "embshift.db"
@@ -201,11 +215,19 @@ storage:
 - `POST /v1/vectors/query`: Execute vector or text search. Returns primary results immediately and asynchronously mirrors queries for shadow quality scoring.
 - `POST /v1/vectors/delete`: Delete vectors by ID across collections.
 
-### Management Plane
-- `GET /api/status`: Retrieve real-time telemetry (parity, lag, spend, state).
+### Observability & Metrics
+- `GET /metrics`: Standard Prometheus metrics exposition (lag, pending queue, DLQ count, tokens, spend, canary weight).
+
+### Management & Control Plane
+- `GET /api/status`: Retrieve real-time telemetry (parity, lag, spend, state, canary weight).
 - `POST /api/backfill/start`: Initiate background backfill.
 - `POST /api/backfill/pause`: Pause background backfill.
 - `POST /api/backfill/resume`: Resume background backfill.
+- `POST /api/canary/set`: Configure phased read traffic splitting (`{"weight": 0.25}`).
+- `POST /api/canary/abort`: Abort canary traffic back to 0%.
+- `GET /api/dlq`: List poison-pill records in Dead-Letter Queue.
+- `POST /api/dlq/retry`: Re-enqueue a DLQ record for replication (`{"id": 123}`).
+- `POST /api/dlq/purge`: Permanently delete a DLQ record (`{"id": 123}`).
 - `POST /api/cutover`: Execute atomic traffic switchover and generate audit manifest.
 - `POST /api/rollback`: Revert primary routing to legacy collection.
 - `GET /api/audit`: Retrieve cryptographic audit manifest.

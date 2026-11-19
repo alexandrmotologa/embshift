@@ -10,6 +10,7 @@ import (
 	"github.com/alexandrmotologa/embshift/internal/config"
 	"github.com/alexandrmotologa/embshift/internal/models"
 	"github.com/alexandrmotologa/embshift/internal/queue"
+	"github.com/alexandrmotologa/embshift/internal/shadow"
 )
 
 // QueryMirror routes production queries to the primary store while asynchronously mirroring traffic to the shadow store.
@@ -33,8 +34,52 @@ func NewQueryMirror(router *Router, cfg *config.Config, q *queue.SQLiteQueue) *Q
 	}
 }
 
-// Query executes search against the active primary and asynchronously mirrors to shadow store.
+// Query executes search with canary splitting support and asynchronous shadow evaluation.
 func (qm *QueryMirror) Query(ctx context.Context, q models.SearchQuery) (*models.SearchResult, error) {
+	canaryWeight := qm.router.GetCanaryWeight()
+
+	// 1. Check if query should take Canary path to target store
+	if canaryWeight > 0 && rand.Float64() < canaryWeight {
+		targetStore := qm.router.GetSecondaryStore()
+		targetEmbedder := qm.router.GetSecondaryEmbedder()
+		if qm.router.GetActivePrimary() == "target" {
+			targetStore = qm.router.GetPrimaryStore()
+			targetEmbedder = qm.router.GetPrimaryEmbedder()
+		}
+
+		targetVec := q.Vector
+		if len(targetVec) == 0 && q.Text != "" {
+			vec, _, err := targetEmbedder.EmbedQuery(ctx, q.Text)
+			if err == nil {
+				targetVec = vec
+			}
+		}
+
+		if len(targetVec) > 0 {
+			targetResult, err := targetStore.Query(ctx, models.SearchQuery{
+				Vector: targetVec,
+				Text:   q.Text,
+				TopK:   q.TopK,
+				Filter: q.Filter,
+			})
+
+			if err == nil {
+				targetResult.IsCanary = true
+				qm.router.RecordCanaryResult(false)
+
+				// Mirror back to legacy in background for drift scoring
+				if q.Text != "" {
+					go qm.runShadowComparison(context.Background(), q.Text, q.TopK, targetResult, true)
+				}
+				return targetResult, nil
+			}
+
+			// Target search failed, record canary error and fall back to legacy
+			qm.router.RecordCanaryResult(true)
+		}
+	}
+
+	// 2. Normal Primary search
 	primaryStore := qm.router.GetPrimaryStore()
 	primaryEmbedder := qm.router.GetPrimaryEmbedder()
 
@@ -48,26 +93,25 @@ func (qm *QueryMirror) Query(ctx context.Context, q models.SearchQuery) (*models
 		q.Vector = vec
 	}
 
-	// 1. Synchronous primary search
 	primaryResult, err := primaryStore.Query(ctx, q)
 	if err != nil {
 		return nil, fmt.Errorf("primary query failed: %w", err)
 	}
 
-	// 2. Sampled asynchronous shadow evaluation
+	// 3. Sampled asynchronous shadow evaluation
 	sampleRatio := qm.cfg.Shadow.SampleRatio
 	if sampleRatio <= 0 {
 		sampleRatio = 0.25
 	}
 
 	if q.Text != "" && (sampleRatio >= 1.0 || rand.Float64() <= sampleRatio) {
-		go qm.runShadowComparison(context.Background(), q.Text, q.TopK, primaryResult)
+		go qm.runShadowComparison(context.Background(), q.Text, q.TopK, primaryResult, false)
 	}
 
 	return primaryResult, nil
 }
 
-func (qm *QueryMirror) runShadowComparison(ctx context.Context, queryText string, topK int, primaryResult *models.SearchResult) {
+func (qm *QueryMirror) runShadowComparison(ctx context.Context, queryText string, topK int, baselineResult *models.SearchResult, baselineIsTarget bool) {
 	secondaryStore := qm.router.GetSecondaryStore()
 	secondaryEmbedder := qm.router.GetSecondaryEmbedder()
 
@@ -75,7 +119,6 @@ func (qm *QueryMirror) runShadowComparison(ctx context.Context, queryText string
 		topK = 10
 	}
 
-	// Embed query with secondary embedder
 	secVec, _, err := secondaryEmbedder.EmbedQuery(ctx, queryText)
 	if err != nil {
 		return
@@ -90,25 +133,39 @@ func (qm *QueryMirror) runShadowComparison(ctx context.Context, queryText string
 		return
 	}
 
-	// Calculate Jaccard similarity @ K
-	jaccard := calculateJaccardSimilarity(primaryResult.Records, secResult.Records)
+	var legacyRecords, targetRecords []models.ScoredRecord
+	var legacyLatency, targetLatency float64
+
+	if baselineIsTarget {
+		targetRecords = baselineResult.Records
+		targetLatency = baselineResult.LatencyMs
+		legacyRecords = secResult.Records
+		legacyLatency = secResult.LatencyMs
+	} else {
+		legacyRecords = baselineResult.Records
+		legacyLatency = baselineResult.LatencyMs
+		targetRecords = secResult.Records
+		targetLatency = secResult.LatencyMs
+	}
+
+	jaccard := shadow.ComputeJaccardAtK(legacyRecords, targetRecords)
+	ndcg := shadow.ComputeNDCGAtK(legacyRecords, targetRecords, topK)
 
 	queryID := fmt.Sprintf("q-%d", time.Now().UnixNano())
 	comparison := models.ShadowComparison{
 		QueryID:           queryID,
 		QueryText:         queryText,
-		LegacyResults:     primaryResult.Records,
-		TargetResults:     secResult.Records,
+		LegacyResults:     legacyRecords,
+		TargetResults:     targetRecords,
 		JaccardSimilarity: jaccard,
-		LegacyLatencyMs:   primaryResult.LatencyMs,
-		TargetLatencyMs:   secResult.LatencyMs,
+		NDCGAtK:           ndcg,
+		LegacyLatencyMs:   legacyLatency,
+		TargetLatencyMs:   targetLatency,
 		Timestamp:         time.Now().UTC(),
 	}
 
-	// Persist to SQLite
-	_ = qm.queue.RecordShadowQuery(queryID, queryText, jaccard, primaryResult.LatencyMs, secResult.LatencyMs)
+	_ = qm.queue.RecordShadowQuery(queryID, queryText, jaccard, legacyLatency, targetLatency)
 
-	// Append to recent in-memory circular buffer
 	qm.mu.Lock()
 	if len(qm.recentShadows) >= qm.maxRecentCount {
 		qm.recentShadows = qm.recentShadows[1:]
@@ -125,37 +182,4 @@ func (qm *QueryMirror) GetRecentShadowComparisons() []models.ShadowComparison {
 	out := make([]models.ShadowComparison, len(qm.recentShadows))
 	copy(out, qm.recentShadows)
 	return out
-}
-
-func calculateJaccardSimilarity(a, b []models.ScoredRecord) float64 {
-	if len(a) == 0 && len(b) == 0 {
-		return 1.0
-	}
-	if len(a) == 0 || len(b) == 0 {
-		return 0.0
-	}
-
-	setA := make(map[string]struct{}, len(a))
-	for _, rec := range a {
-		setA[rec.ID] = struct{}{}
-	}
-
-	intersection := 0
-	union := make(map[string]struct{}, len(a)+len(b))
-	for k := range setA {
-		union[k] = struct{}{}
-	}
-
-	for _, rec := range b {
-		union[rec.ID] = struct{}{}
-		if _, exists := setA[rec.ID]; exists {
-			intersection++
-		}
-	}
-
-	if len(union) == 0 {
-		return 0.0
-	}
-
-	return float64(intersection) / float64(len(union))
 }

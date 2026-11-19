@@ -254,6 +254,9 @@ func createEmbedders(cfg *config.Config) (adapter.Embedder, adapter.Embedder) {
 		targetEmbedder = adapter.NewMockEmbedder(cfg.Embedder.Target.Model, cfg.Embedder.Target.Dimensions)
 	}
 
+	legacyEmbedder.SetPrefixes(cfg.Embedder.Legacy.DocumentPrefix, cfg.Embedder.Legacy.QueryPrefix)
+	targetEmbedder.SetPrefixes(cfg.Embedder.Target.DocumentPrefix, cfg.Embedder.Target.QueryPrefix)
+
 	return legacyEmbedder, targetEmbedder
 }
 

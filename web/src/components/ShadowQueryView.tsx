@@ -1,20 +1,32 @@
 import React, { useState } from 'react'
 import type { MigrationTelemetry } from '../types'
-import { Eye, ChevronRight, ChevronDown, Clock } from 'lucide-react'
+import { Eye, ChevronRight, ChevronDown, Clock, Filter, AlertTriangle } from 'lucide-react'
 
 interface ShadowQueryViewProps {
   telemetry: MigrationTelemetry | null
 }
+
+type DriftFilter = 'all' | 'high_drift' | 'moderate' | 'strong'
 
 export const ShadowQueryView: React.FC<ShadowQueryViewProps> = ({ telemetry }) => {
   const recentQueries = telemetry?.recent_shadow_queries || []
   const avgJaccard = telemetry?.average_jaccard || 0.0
   const evaluatedCount = telemetry?.evaluated_queries || 0
   const [expandedId, setExpandedId] = useState<string | null>(null)
+  const [filter, setFilter] = useState<DriftFilter>('all')
 
   const toggleExpand = (id: string) => {
     setExpandedId(prev => (prev === id ? null : id))
   }
+
+  // Filter queries based on semantic drift
+  const filteredQueries = recentQueries.filter((comp) => {
+    const j = comp.jaccard_similarity
+    if (filter === 'high_drift') return j < 0.35
+    if (filter === 'moderate') return j >= 0.35 && j < 0.70
+    if (filter === 'strong') return j >= 0.70
+    return true
+  })
 
   return (
     <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-5 shadow-sm">
@@ -22,10 +34,10 @@ export const ShadowQueryView: React.FC<ShadowQueryViewProps> = ({ telemetry }) =
         <div>
           <div className="flex items-center gap-2">
             <Eye className="w-4 h-4 text-purple-400" />
-            <h3 className="text-base font-semibold text-white">Shadow Query Evaluation</h3>
+            <h3 className="text-base font-semibold text-white">Shadow Query Evaluation & Semantic Drift</h3>
           </div>
           <p className="text-xs text-slate-400 mt-1">
-            Mirrored production search ranking comparison (Legacy vs Target)
+            Mirrored production search ranking comparison, NDCG gain, and semantic drift detection
           </p>
         </div>
 
@@ -40,15 +52,73 @@ export const ShadowQueryView: React.FC<ShadowQueryViewProps> = ({ telemetry }) =
         </div>
       </div>
 
+      {/* Drift Filter Tabs */}
+      <div className="flex items-center gap-2 mb-3 pb-2 border-b border-slate-800/80 text-xs">
+        <span className="text-slate-500 font-mono flex items-center gap-1 text-[11px]">
+          <Filter className="w-3 h-3" />
+          Filter:
+        </span>
+        <button
+          type="button"
+          onClick={() => setFilter('all')}
+          className={`px-2.5 py-0.5 rounded text-[11px] font-mono transition cursor-pointer ${
+            filter === 'all'
+              ? 'bg-slate-800 text-white font-semibold'
+              : 'text-slate-400 hover:text-white'
+          }`}
+        >
+          All ({recentQueries.length})
+        </button>
+        <button
+          type="button"
+          onClick={() => setFilter('high_drift')}
+          className={`px-2.5 py-0.5 rounded text-[11px] font-mono transition cursor-pointer flex items-center gap-1 ${
+            filter === 'high_drift'
+              ? 'bg-rose-950 text-rose-300 border border-rose-800 font-semibold'
+              : 'text-rose-400/80 hover:text-rose-300'
+          }`}
+        >
+          <AlertTriangle className="w-3 h-3 text-rose-400" />
+          High Drift &lt; 35%
+        </button>
+        <button
+          type="button"
+          onClick={() => setFilter('moderate')}
+          className={`px-2.5 py-0.5 rounded text-[11px] font-mono transition cursor-pointer ${
+            filter === 'moderate'
+              ? 'bg-amber-950 text-amber-300 border border-amber-800 font-semibold'
+              : 'text-amber-400/80 hover:text-amber-300'
+          }`}
+        >
+          Moderate (35-70%)
+        </button>
+        <button
+          type="button"
+          onClick={() => setFilter('strong')}
+          className={`px-2.5 py-0.5 rounded text-[11px] font-mono transition cursor-pointer ${
+            filter === 'strong'
+              ? 'bg-emerald-950 text-emerald-300 border border-emerald-800 font-semibold'
+              : 'text-emerald-400/80 hover:text-emerald-300'
+          }`}
+        >
+          Strong &gt; 70%
+        </button>
+      </div>
+
       {recentQueries.length === 0 ? (
         <div className="py-10 text-center text-slate-500 text-xs border border-dashed border-slate-800 rounded-lg">
           No mirrored production queries captured yet. Use the Query Simulator below or send requests to :8080/v1/vectors/query.
         </div>
+      ) : filteredQueries.length === 0 ? (
+        <div className="py-6 text-center text-slate-500 text-xs bg-slate-950/40 rounded-lg border border-slate-800/60 font-mono">
+          No mirrored queries matching the selected drift filter.
+        </div>
       ) : (
         <div className="space-y-2.5 max-h-[420px] overflow-y-auto pr-1">
-          {recentQueries.map((comp) => {
+          {filteredQueries.map((comp) => {
             const isExpanded = expandedId === comp.query_id
             const jaccardPct = Math.round(comp.jaccard_similarity * 100)
+            const ndcgPct = Math.round((comp.ndcg_at_k || 0) * 100)
 
             return (
               <div
@@ -75,11 +145,16 @@ export const ShadowQueryView: React.FC<ShadowQueryViewProps> = ({ telemetry }) =
                       <Clock className="w-3 h-3 text-slate-500" />
                       {comp.legacy_latency_ms.toFixed(1)}ms / {comp.target_latency_ms.toFixed(1)}ms
                     </span>
+                    <span className="px-2 py-0.5 rounded text-[11px] font-semibold bg-slate-900 border border-slate-800 text-slate-300">
+                      NDCG: {ndcgPct}%
+                    </span>
                     <span
                       className={`px-2 py-0.5 rounded text-[11px] font-semibold ${
-                        jaccardPct >= 50
+                        jaccardPct >= 70
                           ? 'bg-emerald-950 text-emerald-300 border border-emerald-800'
-                          : 'bg-amber-950 text-amber-300 border border-amber-800'
+                          : jaccardPct >= 35
+                          ? 'bg-amber-950 text-amber-300 border border-amber-800'
+                          : 'bg-rose-950 text-rose-300 border border-rose-800'
                       }`}
                     >
                       Jaccard: {jaccardPct}%

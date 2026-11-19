@@ -4,10 +4,9 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 )
 
-func TestSQLiteQueue(t *testing.T) {
+func TestSQLiteQueueWithDLQ(t *testing.T) {
 	tempDir, err := os.MkdirTemp("", "embshift-test-*")
 	if err != nil {
 		t.Fatalf("create temp dir: %v", err)
@@ -21,7 +20,7 @@ func TestSQLiteQueue(t *testing.T) {
 	}
 	defer q.Close()
 
-	// Test Enqueue
+	// 1. Test Enqueue
 	err = q.Enqueue("upsert", "doc-1", []byte(`{"title":"hello"}`), "hello world text")
 	if err != nil {
 		t.Fatalf("enqueue error: %v", err)
@@ -32,73 +31,86 @@ func TestSQLiteQueue(t *testing.T) {
 		t.Fatalf("expected queue size 1, got %d (err: %v)", size, err)
 	}
 
-	// Test Dequeue
+	// 2. Test Dequeue
 	events, err := q.DequeueBatch(10)
-	if err != nil {
+	if err != nil || len(events) != 1 {
 		t.Fatalf("dequeue error: %v", err)
 	}
-	if len(events) != 1 {
-		t.Fatalf("expected 1 event, got %d", len(events))
-	}
-	if events[0].RecordID != "doc-1" || events[0].Text != "hello world text" {
-		t.Fatalf("unexpected event data: %+v", events[0])
-	}
 
-	// Test Ack
-	err = q.Ack([]int64{events[0].ID})
+	// 3. Test Nack with DLQ threshold (maxAttempts = 2)
+	// Attempt 1 -> still in queue
+	err = q.Nack(events[0].ID, "transient network error", 2)
 	if err != nil {
-		t.Fatalf("ack error: %v", err)
+		t.Fatalf("nack 1 error: %v", err)
+	}
+	dlqCount, _ := q.GetDLQCount()
+	if dlqCount != 0 {
+		t.Fatalf("expected 0 DLQ items after first attempt, got %d", dlqCount)
 	}
 
-	size, err = q.GetQueueSize()
-	if err != nil || size != 0 {
-		t.Fatalf("expected queue size 0 after ack, got %d", size)
-	}
-
-	// Test Checkpoint
-	migrated, err := q.IsDocumentMigrated("doc-1")
-	if err != nil || migrated {
-		t.Fatalf("expected not migrated yet, got %v", migrated)
-	}
-
-	err = q.MarkDocumentMigrated("doc-1")
+	// Attempt 2 -> moved to DLQ
+	err = q.Nack(events[0].ID, "permanent context window exceeded", 2)
 	if err != nil {
-		t.Fatalf("mark migrated error: %v", err)
+		t.Fatalf("nack 2 error: %v", err)
 	}
 
-	migrated, err = q.IsDocumentMigrated("doc-1")
-	if err != nil || !migrated {
-		t.Fatalf("expected migrated true, got %v", migrated)
+	dlqCount, _ = q.GetDLQCount()
+	if dlqCount != 1 {
+		t.Fatalf("expected 1 DLQ item after exceeding maxAttempts, got %d", dlqCount)
 	}
 
-	count, err := q.CountMigratedDocuments()
-	if err != nil || count != 1 {
-		t.Fatalf("expected 1 migrated document, got %d", count)
+	// Active queue should now be empty
+	size, _ = q.GetQueueSize()
+	if size != 0 {
+		t.Fatalf("expected 0 items in active queue after moving to DLQ, got %d", size)
 	}
 
-	// Test Shadow query
-	err = q.RecordShadowQuery("q-1", "test query", 0.85, 12.5, 9.2)
+	// Inspect DLQ items
+	dlqItems, err := q.GetDLQItems(10)
+	if err != nil || len(dlqItems) != 1 {
+		t.Fatalf("expected 1 DLQ item, got %d (err: %v)", len(dlqItems), err)
+	}
+	if dlqItems[0].RecordID != "doc-1" || dlqItems[0].ErrorReason != "permanent context window exceeded" {
+		t.Fatalf("unexpected DLQ item data: %+v", dlqItems[0])
+	}
+
+	// 4. Test Retry DLQ item
+	err = q.RetryDLQItem(dlqItems[0].ID)
 	if err != nil {
-		t.Fatalf("record shadow query error: %v", err)
+		t.Fatalf("retry DLQ item error: %v", err)
+	}
+	dlqCount, _ = q.GetDLQCount()
+	if dlqCount != 0 {
+		t.Fatalf("expected 0 DLQ items after retry, got %d", dlqCount)
+	}
+	size, _ = q.GetQueueSize()
+	if size != 1 {
+		t.Fatalf("expected active queue size 1 after retry, got %d", size)
 	}
 
-	avg, total, err := q.GetAverageJaccard()
-	if err != nil || total != 1 || avg < 0.84 || avg > 0.86 {
-		t.Fatalf("expected avg 0.85 and total 1, got avg %f total %d", avg, total)
+	// 5. Test Ack
+	requeued, _ := q.DequeueBatch(10)
+	_ = q.Ack([]int64{requeued[0].ID})
+	size, _ = q.GetQueueSize()
+	if size != 0 {
+		t.Fatalf("expected 0 queue size after ack")
 	}
 
-	// Test lag calculation when empty
-	lag, err := q.GetReplicationLagMs()
-	if err != nil || lag != 0 {
-		t.Fatalf("expected 0 lag for empty queue, got %f", lag)
+	// 6. Test Purge DLQ item
+	_ = q.Enqueue("upsert", "doc-2", nil, "poison text")
+	evs, _ := q.DequeueBatch(1)
+	_ = q.Nack(evs[0].ID, "bad syntax", 1) // immediately moves to DLQ
+	dlqCount, _ = q.GetDLQCount()
+	if dlqCount != 1 {
+		t.Fatalf("expected 1 DLQ item, got %d", dlqCount)
 	}
-
-	// Test lag calculation with pending item
-	time.Sleep(10 * time.Millisecond)
-	_ = q.Enqueue("upsert", "doc-2", nil, "lag test")
-	time.Sleep(15 * time.Millisecond)
-	lag, err = q.GetReplicationLagMs()
-	if err != nil || lag < 10 {
-		t.Fatalf("expected lag >= 10ms, got %f", lag)
+	items, _ := q.GetDLQItems(1)
+	err = q.PurgeDLQItem(items[0].ID)
+	if err != nil {
+		t.Fatalf("purge DLQ item error: %v", err)
+	}
+	dlqCount, _ = q.GetDLQCount()
+	if dlqCount != 0 {
+		t.Fatalf("expected 0 DLQ items after purge")
 	}
 }

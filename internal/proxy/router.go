@@ -11,12 +11,15 @@ import (
 	"github.com/alexandrmotologa/embshift/internal/queue"
 )
 
-// Router governs the active routing state, vector stores, and atomic cutover transition.
+// Router governs the active routing state, vector stores, canary traffic, and atomic cutover transition.
 type Router struct {
 	mu                 sync.RWMutex
 	cfg                *config.Config
 	state              models.MigrationState
 	activePrimary      string // "legacy" or "target"
+	canaryWeight       float64 // 0.0 to 1.0
+	canaryTotal        int64
+	canaryErrors       int64
 	cutoverAt          *time.Time
 	legacyStore        adapter.VectorStore
 	targetStore        adapter.VectorStore
@@ -33,10 +36,16 @@ func NewRouter(
 	legacyEmbedder, targetEmbedder adapter.Embedder,
 	q *queue.SQLiteQueue,
 ) *Router {
+	initialCanary := cfg.Cutover.InitialCanaryWeight
+	if initialCanary < 0 || initialCanary > 1.0 {
+		initialCanary = 0.0
+	}
+
 	return &Router{
 		cfg:                cfg,
 		state:              models.StateIdle,
 		activePrimary:      "legacy",
+		canaryWeight:       initialCanary,
 		legacyStore:        legacyStore,
 		targetStore:        targetStore,
 		legacyEmbedder:     legacyEmbedder,
@@ -65,6 +74,65 @@ func (r *Router) SetState(s models.MigrationState) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.state = s
+}
+
+// GetCanaryWeight returns the percentage of read traffic routed to the target collection.
+func (r *Router) GetCanaryWeight() float64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.canaryWeight
+}
+
+// SetCanaryWeight configures the canary traffic fraction (0.0 to 1.0).
+func (r *Router) SetCanaryWeight(weight float64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if weight < 0.0 || weight > 1.0 {
+		return fmt.Errorf("canary weight must be between 0.0 and 1.0, got %f", weight)
+	}
+
+	r.canaryWeight = weight
+	if weight > 0 && r.activePrimary == "legacy" {
+		r.state = models.StateCanaryRouting
+	} else if weight == 0 && r.state == models.StateCanaryRouting {
+		r.state = models.StateShadowTesting
+	}
+	return nil
+}
+
+// RecordCanaryResult updates canary telemetry and triggers auto-abort if error threshold is breached.
+func (r *Router) RecordCanaryResult(isError bool) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.canaryTotal++
+	if isError {
+		r.canaryErrors++
+	}
+
+	maxErrorRate := r.cfg.Cutover.MaxCanaryErrorRate
+	if maxErrorRate <= 0 {
+		maxErrorRate = 0.05 // default 5%
+	}
+
+	if r.canaryTotal >= 10 && float64(r.canaryErrors)/float64(r.canaryTotal) > maxErrorRate {
+		// Auto-abort canary traffic back to 0%
+		r.canaryWeight = 0.0
+		r.state = models.StateShadowTesting
+		return true
+	}
+	return false
+}
+
+// AbortCanary forces canary weight back to 0%.
+func (r *Router) AbortCanary() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.canaryWeight = 0.0
+	if r.state == models.StateCanaryRouting {
+		r.state = models.StateShadowTesting
+	}
 }
 
 // GetPrimaryStore returns the vector store currently serving live production traffic.
@@ -116,7 +184,6 @@ func (r *Router) ExecuteCutover() (*models.AuditManifest, error) {
 		return nil, fmt.Errorf("cutover already executed: target is currently active primary")
 	}
 
-	// Verify cutover preconditions
 	lag, err := r.queue.GetReplicationLagMs()
 	if err != nil {
 		return nil, fmt.Errorf("check replication lag: %w", err)
@@ -135,6 +202,7 @@ func (r *Router) ExecuteCutover() (*models.AuditManifest, error) {
 
 	now := time.Now().UTC()
 	r.activePrimary = "target"
+	r.canaryWeight = 0.0 // Cutover complete, target is 100% primary
 	r.state = models.StateCutoverComplete
 	r.cutoverAt = &now
 
@@ -171,6 +239,7 @@ func (r *Router) ExecuteRollback() error {
 	}
 
 	r.activePrimary = "legacy"
+	r.canaryWeight = 0.0
 	r.state = models.StateRolledBack
 	return nil
 }

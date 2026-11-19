@@ -8,4 +8,5 @@ type Embedder interface {
 	Dimensions() int
 	EmbedTexts(ctx context.Context, texts []string) ([][]float32, int64, error)
 	EmbedQuery(ctx context.Context, text string) ([]float32, int64, error)
+	SetPrefixes(documentPrefix, queryPrefix string)
 }

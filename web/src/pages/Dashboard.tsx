@@ -1,10 +1,12 @@
 import React, { useState, useEffect, useCallback } from 'react'
-import type { MigrationTelemetry, AuditManifest } from '../types'
+import type { MigrationTelemetry, AuditManifest, DLQItem } from '../types'
 import { Header } from '../components/Header'
 import { MigrationProgressBar } from '../components/MigrationProgressBar'
 import { DualWriteLagGauge } from '../components/DualWriteLagGauge'
 import { SpendTracker } from '../components/SpendTracker'
 import { ShadowQueryView } from '../components/ShadowQueryView'
+import { CanarySlider } from '../components/CanarySlider'
+import { DLQInspector } from '../components/DLQInspector'
 import { CutoverButton } from '../components/CutoverButton'
 import { QuerySimulator } from '../components/QuerySimulator'
 import { AuditModal } from '../components/AuditModal'
@@ -12,11 +14,17 @@ import { AuditModal } from '../components/AuditModal'
 export const Dashboard: React.FC = () => {
   const [telemetry, setTelemetry] = useState<MigrationTelemetry | null>(null)
   const [auditManifest, setAuditManifest] = useState<AuditManifest | null>(null)
+  const [dlqItems, setDlqItems] = useState<DLQItem[]>([])
   const [showAuditModal, setShowAuditModal] = useState(false)
   const [loadingAction, setLoadingAction] = useState(false)
   const [feedbackMessage, setFeedbackMessage] = useState<string | null>(null)
 
-  // Fetch initial telemetry
+  const showToast = (msg: string) => {
+    setFeedbackMessage(msg)
+    setTimeout(() => setFeedbackMessage(null), 3500)
+  }
+
+  // Fetch telemetry
   const fetchStatus = useCallback(async () => {
     try {
       const res = await fetch('/api/status')
@@ -29,10 +37,23 @@ export const Dashboard: React.FC = () => {
     }
   }, [])
 
+  // Fetch DLQ items
+  const fetchDLQ = useCallback(async () => {
+    try {
+      const res = await fetch('/api/dlq')
+      if (res.ok) {
+        const data = await res.json()
+        setDlqItems(data.items || [])
+      }
+    } catch {
+      // Ignore
+    }
+  }, [])
+
   useEffect(() => {
     fetchStatus()
+    fetchDLQ()
 
-    // Establish Server-Sent Events connection
     const eventSource = new EventSource('/api/events')
 
     eventSource.addEventListener('telemetry', (e) => {
@@ -55,6 +76,10 @@ export const Dashboard: React.FC = () => {
       }
     })
 
+    eventSource.addEventListener('canary', () => {
+      fetchStatus()
+    })
+
     eventSource.addEventListener('rollback', () => {
       fetchStatus()
     })
@@ -62,12 +87,7 @@ export const Dashboard: React.FC = () => {
     return () => {
       eventSource.close()
     }
-  }, [fetchStatus])
-
-  const showToast = (msg: string) => {
-    setFeedbackMessage(msg)
-    setTimeout(() => setFeedbackMessage(null), 3500)
-  }
+  }, [fetchStatus, fetchDLQ])
 
   const handleStartBackfill = async () => {
     setLoadingAction(true)
@@ -104,6 +124,39 @@ export const Dashboard: React.FC = () => {
       const res = await fetch('/api/backfill/resume', { method: 'POST' })
       if (res.ok) {
         showToast('Backfill resumed')
+        fetchStatus()
+      }
+    } finally {
+      setLoadingAction(false)
+    }
+  }
+
+  const handleSetCanaryWeight = async (weight: number) => {
+    setLoadingAction(true)
+    try {
+      const res = await fetch('/api/canary/set', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ weight }),
+      })
+      if (res.ok) {
+        showToast(`Canary traffic set to ${Math.round(weight * 100)}%`)
+        fetchStatus()
+      } else {
+        const err = await res.text()
+        showToast(`Canary error: ${err}`)
+      }
+    } finally {
+      setLoadingAction(false)
+    }
+  }
+
+  const handleAbortCanary = async () => {
+    setLoadingAction(true)
+    try {
+      const res = await fetch('/api/canary/abort', { method: 'POST' })
+      if (res.ok) {
+        showToast('Canary traffic aborted. Read traffic reverted to 100% legacy.')
         fetchStatus()
       }
     } finally {
@@ -180,6 +233,42 @@ export const Dashboard: React.FC = () => {
     }
   }
 
+  const handleRetryDLQ = async (id: number) => {
+    setLoadingAction(true)
+    try {
+      const res = await fetch('/api/dlq/retry', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id }),
+      })
+      if (res.ok) {
+        showToast('Record re-enqueued for migration')
+        fetchDLQ()
+        fetchStatus()
+      }
+    } finally {
+      setLoadingAction(false)
+    }
+  }
+
+  const handlePurgeDLQ = async (id: number) => {
+    setLoadingAction(true)
+    try {
+      const res = await fetch('/api/dlq/purge', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id }),
+      })
+      if (res.ok) {
+        showToast('Record purged from DLQ')
+        fetchDLQ()
+        fetchStatus()
+      }
+    } finally {
+      setLoadingAction(false)
+    }
+  }
+
   const handleOpenAudit = async () => {
     try {
       const res = await fetch('/api/audit')
@@ -208,7 +297,6 @@ export const Dashboard: React.FC = () => {
         loadingAction={loadingAction}
       />
 
-      {/* Floating feedback toast */}
       {feedbackMessage && (
         <div className="fixed bottom-6 right-6 z-50 px-4 py-2.5 rounded-lg bg-blue-600 text-white text-xs font-medium shadow-xl border border-blue-400/40 animate-fade-in">
           {feedbackMessage}
@@ -226,7 +314,7 @@ export const Dashboard: React.FC = () => {
           </div>
         </div>
 
-        {/* Row 2: Spend & Cutover Switch */}
+        {/* Row 2: Spend Tracker & Cutover Switch */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           <div>
             <SpendTracker telemetry={telemetry} />
@@ -240,12 +328,34 @@ export const Dashboard: React.FC = () => {
           </div>
         </div>
 
-        {/* Row 3: Shadow Query Evaluation */}
+        {/* Row 3: Canary Phased Routing */}
+        <div>
+          <CanarySlider
+            canaryWeight={telemetry?.canary_weight || 0}
+            onSetCanaryWeight={handleSetCanaryWeight}
+            onAbortCanary={handleAbortCanary}
+            disabled={loadingAction || telemetry?.state === 'cutover_complete'}
+          />
+        </div>
+
+        {/* Row 4: Shadow Query Evaluation with Semantic Drift Filter */}
         <div>
           <ShadowQueryView telemetry={telemetry} />
         </div>
 
-        {/* Row 4: Live Query Simulator */}
+        {/* Row 5: Dead-Letter Queue (DLQ) Inspector */}
+        <div>
+          <DLQInspector
+            dlqCount={telemetry?.dlq_count || 0}
+            dlqItems={dlqItems}
+            onRetryItem={handleRetryDLQ}
+            onPurgeItem={handlePurgeDLQ}
+            onRefresh={fetchDLQ}
+            loading={loadingAction}
+          />
+        </div>
+
+        {/* Row 6: Live Query Simulator */}
         <div>
           <QuerySimulator
             onSimulateQuery={handleSimulateQuery}
@@ -255,7 +365,7 @@ export const Dashboard: React.FC = () => {
       </main>
 
       <footer className="border-t border-slate-900 py-6 px-6 text-center text-xs text-slate-500 font-mono">
-        embshift v1.0.0 &bull; Zero-Downtime Vector Store Migration Engine &bull; Go Runtime &lt; 20MB RAM
+        embshift v1.0.0 &bull; Zero-Downtime Vector Store Migration Engine &bull; Prometheus Metrics: /metrics &bull; Go Runtime &lt; 20MB RAM
       </footer>
 
       {showAuditModal && (

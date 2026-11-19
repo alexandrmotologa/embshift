@@ -151,4 +151,45 @@ func TestServerEndpoints(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected delete 200, got %d", rec.Code)
 	}
+
+	// 7. Test GET /metrics (Prometheus exposition)
+	req = httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected metrics 200, got %d", rec.Code)
+	}
+	metricsBody := rec.Body.String()
+	if !bytes.Contains([]byte(metricsBody), []byte("embshift_replication_lag_milliseconds")) {
+		t.Fatalf("expected metrics to contain embshift_replication_lag_milliseconds")
+	}
+
+	// 8. Test Canary APIs
+	canaryReq := map[string]any{"weight": 0.20}
+	b, _ = json.Marshal(canaryReq)
+	req = httptest.NewRequest(http.MethodPost, "/api/canary/set", bytes.NewReader(b))
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected canary set 200, got %d", rec.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/canary/abort", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected canary abort 200, got %d", rec.Code)
+	}
+
+	// 9. Test GET /api/dlq
+	req = httptest.NewRequest(http.MethodGet, "/api/dlq", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected dlq 200, got %d", rec.Code)
+	}
 }
