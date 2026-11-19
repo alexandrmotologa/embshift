@@ -1,0 +1,70 @@
+# embshift: Production Vector Migration Configuration
+# Zero-Downtime Vector Database Migration, Dual-Write Proxy, and Shadow Evaluator
+
+proxy:
+  host: "0.0.0.0"
+  port: 8080
+  studio_port: 8787
+
+# Legacy Vector Store (Active Primary prior to cutover)
+legacy:
+  type: "mock" # options: "qdrant", "pgvector", "pinecone", "mock"
+  endpoint: "http://localhost:6333"
+  api_key: ""
+  collection: "knowledge-base-v1"
+  dimensions: 1536
+  model: "text-embedding-ada-002"
+
+# Target Vector Store (Replacement Destination)
+target:
+  type: "mock" # options: "qdrant", "pgvector", "pinecone", "mock"
+  endpoint: "http://localhost:6334"
+  api_key: ""
+  collection: "knowledge-base-v2"
+  dimensions: 3072
+  model: "text-embedding-3-large"
+
+# Embedding Providers
+embedder:
+  legacy:
+    type: "mock" # options: "openai", "voyage", "ollama", "mock"
+    endpoint: "https://api.openai.com/v1"
+    api_key: ""
+    model: "text-embedding-ada-002"
+    dimensions: 1536
+    price_per_million_tokens_usd: 0.10
+
+  target:
+    type: "mock" # options: "openai", "voyage", "ollama", "mock"
+    endpoint: "https://api.openai.com/v1"
+    api_key: ""
+    model: "text-embedding-3-large"
+    dimensions: 3072
+    price_per_million_tokens_usd: 0.13
+
+# Background Rate-Limited Backfill
+backfill:
+  batch_size: 100
+  concurrency: 4
+  requests_per_minute: 3000
+  tokens_per_minute: 1000000
+  max_budget_usd: 50.00
+  text_field: "text"
+
+# Production Shadow Query Evaluation
+shadow:
+  sample_ratio: 0.25 # Mirror 25% of live production search requests
+  top_k: 10
+  min_jaccard_threshold: 0.40
+  max_latency_delta_ms: 150.0
+
+# Cutover Safety Gates
+cutover:
+  require_parity_ratio: 1.0 # 100% document parity required
+  max_replication_lag_ms: 100.0 # Maximum allowed buffer lag
+  require_zero_pending_queue: true # Queue must be drained
+  enable_reverse_replication: true # Allow instant 1-click rollback
+
+# Local State Persistence
+storage:
+  sqlite_path: "embshift.db"
