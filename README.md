@@ -1,6 +1,22 @@
-# embshift
+<p align="center">
+  <img src="docs/images/logo.png" alt="embshift Logo" width="180" height="180" />
+</p>
+<h1 align="center">embshift</h1>
+<p align="center">
+  <strong>Zero-Downtime Vector Database Migration & Shadow Re-Embedding Engine</strong>
+</p>
+<p align="center">
+  <a href="https://github.com/alexandrmotologa/embshift/actions"><img src="https://img.shields.io/badge/build-passing-brightgreen?style=flat-square" alt="Build" /></a>
+  <a href="https://golang.org"><img src="https://img.shields.io/badge/go-1.24-00ADD8?style=flat-square&logo=go" alt="Go Version" /></a>
+  <a href="https://react.dev"><img src="https://img.shields.io/badge/react-19-61DAFB?style=flat-square&logo=react" alt="React 19" /></a>
+  <a href="https://prometheus.io"><img src="https://img.shields.io/badge/metrics-prometheus-E6522C?style=flat-square&logo=prometheus" alt="Prometheus" /></a>
+  <a href="https://sqlite.org"><img src="https://img.shields.io/badge/queue-pure--Go%20SQLite%20WAL-003B57?style=flat-square&logo=sqlite" alt="SQLite" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License" /></a>
+</p>
 
-Zero-downtime vector database migration proxy, dual-write engine, and shadow re-embedding orchestrator with an embedded React 19 cockpit.
+<p align="center">
+  <img src="docs/images/embshift_demo.gif" alt="embshift Migration Cockpit Interactive Demo" width="900" />
+</p>
 
 ```
        +-------------------------------------------------------------+
@@ -63,7 +79,7 @@ Zero-downtime vector database migration proxy, dual-write engine, and shadow re-
 
 ## Problem Statement
 
-When upgrading foundation embedding models in production RAG systems (for example, migrating from 1536-dimensional OpenAI Ada-002 to 3072-dimensional text-embedding-3-large or Voyage-3), engineering teams face fundamental obstacles:
+When upgrading foundation embedding models in production RAG systems (for example, migrating from 1536-dimensional OpenAI Ada-002 to 3072-dimensional text-embedding-3-large or Voyage-3), engineering teams face four fundamental obstacles:
 1. Mathematical incompatibility. Vectors from different models cannot be queried in the same vector space. Cosine similarity between an Ada-002 query and a text-embedding-3 vector is undefined.
 2. Search downtime. Shutting down the legacy index during backfill stops semantic search and retrieval workflows.
 3. In-flight drift. New writes and deletes occurring during hours of batch re-embedding cause state divergence between indices.
@@ -71,13 +87,29 @@ When upgrading foundation embedding models in production RAG systems (for exampl
 
 embshift resolves these issues by acting as a transparent proxy that coordinates dual-writing, manages rate-limited backfills with token budget caps, runs live shadow query evaluations, and executes atomic cutovers with instant rollback support.
 
+## Migration Cockpit
+
+The single binary embeds a lightweight React 19 single-page application communicating over Server-Sent Events (SSE). It exposes controls for live dual-writing replication latency, spend tracking, dead-letter queue (DLQ) retry management, phased canary traffic routing, and atomic cutover execution.
+
+<p align="center">
+  <img src="docs/images/embshift_dashboard_desktop.png" alt="embshift Migration Cockpit Desktop View" width="900" />
+</p>
+
+### Responsive Multi-Device Cockpit
+
+The cockpit adapts to both high-resolution operations displays and mobile incident response screens:
+
+<p align="center">
+  <img src="docs/images/embshift_dashboard_mobile.png" alt="embshift Migration Cockpit Mobile Responsive View" width="360" />
+</p>
+
 ## Core Capabilities
 
 - Transparent Dual-Writing Proxy: Commits writes and deletes synchronously to the active primary store while asynchronously staging updates to the target store via an embedded SQLite WAL queue.
 - Rate-Limited Backfill Orchestrator: Traverses legacy collections with cursor pagination, pacing embedding API requests through a token bucket rate limiter with dollar budget caps.
 - Production Shadow Query Evaluation: Mirrors a configurable fraction of live search traffic to the target store, computing Jaccard similarity and NDCG without adding latency to client responses.
 - Phased Canary Traffic Routing: Progressively routes read traffic (0% to 100%) to the target index with automated abort guards triggered on error rate anomalies.
-- Dead-Letter Queue (DLQ) & Poison-Pill Inspector: Sequewsters corrupted or oversized documents after retry thresholds, allowing live inspection and retry from the web studio.
+- Dead-Letter Queue (DLQ) & Poison-Pill Inspector: Sequestrates corrupted or oversized documents after retry thresholds, allowing live inspection and retry from the web studio.
 - Asymmetric Prefix & Template Engine: Supports prompt prefixes required by modern embedding architectures (such as `passage: ` and `query: ` for Voyage, BGE, and E5 models).
 - Prometheus Observability Exporter: Serves `/metrics` in the standard exposition format for immediate ingestion by Prometheus, Datadog, or Grafana.
 - Atomic Zero-Downtime Cutover: Executes an in-memory pointer swap to reroute production traffic once corpus parity reaches 100% and quality gates pass.
@@ -235,9 +267,9 @@ storage:
 
 ## Documentation
 
-- [Architecture Invariants](file:///B:/workgit/embshift/docs/ARCHITECTURE.md)
-- [Production Runbook](file:///B:/workgit/embshift/docs/RUNBOOK.md)
-- [Performance Benchmarks](file:///B:/workgit/embshift/docs/BENCHMARKS.md)
+- [Architecture Invariants](docs/ARCHITECTURE.md)
+- [Production Runbook](docs/RUNBOOK.md)
+- [Performance Benchmarks](docs/BENCHMARKS.md)
 
 ## License
 
